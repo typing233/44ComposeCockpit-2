@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -86,6 +85,9 @@ func main() {
 	defer broker.Close()
 	sseHandler := sse.NewHandler(broker, logger)
 
+	// Docker streamer (events, stats, logs)
+	streamer := docker.NewStreamer(dockerClient, broker, logger)
+
 	// Project handler (also serves as project resolver)
 	projectHandler := handlers.NewProjectHandler(scanner, parser, ops, aclRepo, cfg.Discovery.RootDir, logger)
 
@@ -93,18 +95,22 @@ func main() {
 	locker := orchestrator.NewInMemoryLocker()
 	executor := orchestrator.NewExecutor(ops, locker, projectHandler, auditRepo, logger)
 
+	// Start executor workers
+	executor.StartWorkers(ctx, 4)
+
 	// Run initial project scan
 	if err := projectHandler.InitialScan(ctx); err != nil {
 		logger.Warn("initial scan failed", "error", err)
 	}
 
-	// Start Docker event streaming
-	go streamDockerEvents(ctx, dockerClient, broker, logger)
+	// Start Docker event streaming and periodic stats collection
+	go streamer.StreamDockerEvents(ctx)
+	go streamer.StartStatsCollector(ctx, 5*time.Second)
 
 	// Handlers
 	authHandler := handlers.NewAuthHandler(userRepo, jwtManager)
 	opHandler := handlers.NewOperationHandler(executor)
-	eventsHandler := handlers.NewEventsHandler(sseHandler, logger)
+	eventsHandler := handlers.NewEventsHandler(sseHandler, streamer, projectHandler, logger)
 	userHandler := handlers.NewUserHandler(userRepo)
 	auditHandler := handlers.NewAuditHandler(auditRepo)
 	healthHandler := handlers.NewHealthHandler(db, dockerClient)
@@ -121,6 +127,7 @@ func main() {
 		AuditHandler:     auditHandler,
 		HealthHandler:    healthHandler,
 		JWTManager:       jwtManager,
+		ACLRepo:          aclRepo,
 		Logger:           logger,
 	})
 
@@ -158,54 +165,6 @@ func main() {
 
 	cancel()
 	logger.Info("server stopped")
-}
-
-func streamDockerEvents(ctx context.Context, client docker.Client, broker sse.Broker, logger *slog.Logger) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		eventCh, errCh := client.Events(ctx, docker.EventsOptions{
-			Filters: map[string][]string{
-				"type": {"container", "network", "volume"},
-			},
-		})
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case event, ok := <-eventCh:
-				if !ok {
-					goto reconnect
-				}
-				sseEvent := sse.Event{
-					Type: sse.EventDockerEvent,
-					Data: event,
-				}
-
-				projectID := event.Actor.Attributes["com.composecockpit.project"]
-				if projectID != "" {
-					broker.Publish(fmt.Sprintf("project:%s:events", projectID), sseEvent)
-				}
-				broker.Publish("global:events", sseEvent)
-
-			case err, ok := <-errCh:
-				if !ok {
-					goto reconnect
-				}
-				logger.Warn("docker events error", "error", err)
-				goto reconnect
-			}
-		}
-
-	reconnect:
-		logger.Info("reconnecting docker events stream")
-		time.Sleep(5 * time.Second)
-	}
 }
 
 func setLogLevel(logger *slog.Logger, level string) {

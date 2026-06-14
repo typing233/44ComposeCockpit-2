@@ -31,23 +31,24 @@ type composeFile struct {
 	Services map[string]composeService `yaml:"services"`
 	Networks map[string]composeNetwork `yaml:"networks"`
 	Volumes  map[string]composeVolume  `yaml:"volumes"`
-	Include  []includeEntry            `yaml:"include"`
+	Include  interface{}               `yaml:"include"`
 }
 
 type composeService struct {
-	Image       string                       `yaml:"image"`
-	Build       interface{}                  `yaml:"build"`
-	Ports       []interface{}                `yaml:"ports"`
-	Environment interface{}                  `yaml:"environment"`
-	Labels      interface{}                  `yaml:"labels"`
-	DependsOn   interface{}                  `yaml:"depends_on"`
-	Profiles    []string                     `yaml:"profiles"`
-	Volumes     []interface{}                `yaml:"volumes"`
-	Networks    interface{}                  `yaml:"networks"`
-	Restart     string                       `yaml:"restart"`
-	Command     interface{}                  `yaml:"command"`
-	Entrypoint  interface{}                  `yaml:"entrypoint"`
-	Extends     *extendsConfig               `yaml:"extends"`
+	Image       string      `yaml:"image"`
+	Build       interface{} `yaml:"build"`
+	Ports       []interface{} `yaml:"ports"`
+	Environment interface{} `yaml:"environment"`
+	Labels      interface{} `yaml:"labels"`
+	DependsOn   interface{} `yaml:"depends_on"`
+	Profiles    []string    `yaml:"profiles"`
+	Volumes     []interface{} `yaml:"volumes"`
+	Networks    interface{} `yaml:"networks"`
+	Restart     string      `yaml:"restart"`
+	Command     interface{} `yaml:"command"`
+	Entrypoint  interface{} `yaml:"entrypoint"`
+	Extends     *extendsConfig `yaml:"extends"`
+	EnvFile     interface{} `yaml:"env_file"`
 }
 
 type composeNetwork struct {
@@ -55,6 +56,7 @@ type composeNetwork struct {
 	Driver   string            `yaml:"driver"`
 	External interface{}       `yaml:"external"`
 	Labels   map[string]string `yaml:"labels"`
+	IPAM     interface{}       `yaml:"ipam"`
 }
 
 type composeVolume struct {
@@ -62,11 +64,6 @@ type composeVolume struct {
 	Driver   string            `yaml:"driver"`
 	External interface{}       `yaml:"external"`
 	Labels   map[string]string `yaml:"labels"`
-}
-
-type includeEntry struct {
-	Path    string `yaml:"path"`
-	EnvFile string `yaml:"env_file"`
 }
 
 type extendsConfig struct {
@@ -94,16 +91,32 @@ func (p *composeParser) Parse(ctx context.Context, disc DiscoveredProject) (*dom
 		if err != nil {
 			return nil, fmt.Errorf("parse %s: %w", filePath, err)
 		}
+		// Resolve include directives before merging
+		if err := p.resolveIncludes(ctx, filepath.Dir(filePath), cf, envVars, 0); err != nil {
+			return nil, fmt.Errorf("resolve includes in %s: %w", filePath, err)
+		}
 		p.mergeInto(&merged, cf)
 	}
 
+	// Resolve extends after all files merged
 	for name, svc := range merged.Services {
 		if svc.Extends != nil {
 			resolved, err := p.resolveExtends(disc.Path, svc.Extends, envVars, 0)
 			if err != nil {
 				return nil, fmt.Errorf("resolve extends for service %s: %w", name, err)
 			}
-			merged.Services[name] = p.mergeService(resolved, svc)
+			result := p.mergeService(resolved, svc)
+			result.Extends = nil
+			merged.Services[name] = result
+		}
+	}
+
+	// Resolve env_file per service
+	for name, svc := range merged.Services {
+		if svc.EnvFile != nil {
+			extraEnv := p.loadServiceEnvFiles(disc.Path, svc.EnvFile)
+			svc.Environment = mergeEnvInterface(extraEnv, svc.Environment)
+			merged.Services[name] = svc
 		}
 	}
 
@@ -153,6 +166,97 @@ func (p *composeParser) Parse(ctx context.Context, disc DiscoveredProject) (*dom
 	return project, nil
 }
 
+// resolveIncludes processes the `include` directive recursively, merging
+// all included compose files into the parent.
+func (p *composeParser) resolveIncludes(ctx context.Context, baseDir string, cf *composeFile, envVars map[string]string, depth int) error {
+	if cf.Include == nil || depth > 10 {
+		return nil
+	}
+
+	includes := p.parseIncludeEntries(baseDir, cf.Include)
+	for _, inc := range includes {
+		// Load optional env_file for the include
+		incEnv := make(map[string]string)
+		for k, v := range envVars {
+			incEnv[k] = v
+		}
+		if inc.envFile != "" {
+			parseEnvFile(inc.envFile, incEnv)
+		}
+
+		incFile, err := p.parseFile(inc.path, incEnv)
+		if err != nil {
+			p.logger.Warn("include parse failed", "path", inc.path, "error", err)
+			continue
+		}
+
+		// Recursively resolve nested includes
+		if err := p.resolveIncludes(ctx, filepath.Dir(inc.path), incFile, incEnv, depth+1); err != nil {
+			return err
+		}
+
+		p.mergeInto(cf, incFile)
+	}
+
+	cf.Include = nil
+	return nil
+}
+
+type includeRef struct {
+	path    string
+	envFile string
+}
+
+func (p *composeParser) parseIncludeEntries(baseDir string, raw interface{}) []includeRef {
+	var refs []includeRef
+	switch val := raw.(type) {
+	case []interface{}:
+		for _, item := range val {
+			switch entry := item.(type) {
+			case string:
+				refs = append(refs, includeRef{path: filepath.Join(baseDir, entry)})
+			case map[string]interface{}:
+				ref := includeRef{}
+				if path, ok := entry["path"].(string); ok {
+					ref.path = filepath.Join(baseDir, path)
+				}
+				if envFile, ok := entry["env_file"].(string); ok {
+					ref.envFile = filepath.Join(baseDir, envFile)
+				}
+				if ref.path != "" {
+					refs = append(refs, ref)
+				}
+			}
+		}
+	case string:
+		refs = append(refs, includeRef{path: filepath.Join(baseDir, val)})
+	}
+	return refs
+}
+
+func (p *composeParser) loadServiceEnvFiles(projectDir string, envFile interface{}) interface{} {
+	env := make(map[string]string)
+	switch val := envFile.(type) {
+	case string:
+		parseEnvFile(filepath.Join(projectDir, val), env)
+	case []interface{}:
+		for _, item := range val {
+			switch entry := item.(type) {
+			case string:
+				parseEnvFile(filepath.Join(projectDir, entry), env)
+			case map[string]interface{}:
+				if path, ok := entry["path"].(string); ok {
+					parseEnvFile(filepath.Join(projectDir, path), env)
+				}
+			}
+		}
+	}
+	if len(env) == 0 {
+		return nil
+	}
+	return env
+}
+
 func (p *composeParser) parseFile(filePath string, envVars map[string]string) (*composeFile, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -164,6 +268,15 @@ func (p *composeParser) parseFile(filePath string, envVars map[string]string) (*
 	var cf composeFile
 	if err := yaml.Unmarshal([]byte(expanded), &cf); err != nil {
 		return nil, fmt.Errorf("yaml unmarshal: %w", err)
+	}
+	if cf.Services == nil {
+		cf.Services = make(map[string]composeService)
+	}
+	if cf.Networks == nil {
+		cf.Networks = make(map[string]composeNetwork)
+	}
+	if cf.Volumes == nil {
+		cf.Volumes = make(map[string]composeVolume)
 	}
 	return &cf, nil
 }
@@ -220,6 +333,9 @@ func (p *composeParser) mergeService(base, override composeService) composeServi
 	}
 	if override.Entrypoint != nil {
 		base.Entrypoint = override.Entrypoint
+	}
+	if override.EnvFile != nil {
+		base.EnvFile = override.EnvFile
 	}
 	return base
 }

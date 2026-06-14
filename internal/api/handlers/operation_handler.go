@@ -76,17 +76,60 @@ func (h *OperationHandler) CancelOperation(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *OperationHandler) GetOperation(w http.ResponseWriter, r *http.Request) {
-	ops := h.executor.GetRunningOps()
 	opID := chi.URLParam(r, "opID")
 
-	for _, op := range ops {
-		if op.ID == opID {
-			httputil.WriteJSON(w, r, http.StatusOK, op)
-			return
+	record, ok := h.executor.GetOperation(opID)
+	if !ok {
+		httputil.WriteError(w, r, http.StatusNotFound, apierr.ErrOperationNotFound, "operation not found", nil)
+		return
+	}
+
+	httputil.WriteJSON(w, r, http.StatusOK, record)
+}
+
+func (h *OperationHandler) ListRunning(w http.ResponseWriter, r *http.Request) {
+	ops := h.executor.GetRunningOps()
+	httputil.WriteJSON(w, r, http.StatusOK, map[string]interface{}{
+		"running":    ops,
+		"queue_size": h.executor.GetQueueLen(),
+	})
+}
+
+func (h *OperationHandler) SubmitAsync(w http.ResponseWriter, r *http.Request) {
+	projectID := domain.ProjectID(chi.URLParam(r, "projectID"))
+	opType := domain.OperationType(chi.URLParam(r, "action"))
+	claims := auth.GetClaims(r.Context())
+
+	var body OperationBody
+	if r.Body != nil {
+		json.NewDecoder(r.Body).Decode(&body)
+	}
+
+	timeout := 5 * time.Minute
+	if body.Timeout != "" {
+		if d, err := time.ParseDuration(body.Timeout); err == nil {
+			timeout = d
 		}
 	}
 
-	httputil.WriteError(w, r, http.StatusNotFound, apierr.ErrOperationNotFound, "operation not found or completed", nil)
+	priority := 50
+	if claims.Role == domain.RoleAdmin {
+		priority = 100
+	}
+
+	req := domain.OperationRequest{
+		Type:     opType,
+		Scope:    domain.OperationScope{ProjectID: projectID, Services: body.Services},
+		UserID:   claims.UserID,
+		Priority: priority,
+		Timeout:  timeout,
+	}
+
+	opID := h.executor.Submit(req)
+	httputil.WriteJSON(w, r, http.StatusAccepted, map[string]string{
+		"operation_id": opID,
+		"status":       "queued",
+	})
 }
 
 func (h *OperationHandler) executeOp(w http.ResponseWriter, r *http.Request, opType domain.OperationType) {

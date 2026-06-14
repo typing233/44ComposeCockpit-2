@@ -23,15 +23,21 @@ type AuditLogger interface {
 }
 
 type Executor struct {
-	ops        *docker.Operations
-	locker     ProjectLocker
-	resolver   ProjectResolver
-	auditor    AuditLogger
-	logger     *slog.Logger
+	ops      *docker.Operations
+	locker   ProjectLocker
+	resolver ProjectResolver
+	auditor  AuditLogger
+	queue    *PriorityQueue
+	logger   *slog.Logger
 
-	mu         sync.RWMutex
-	running    map[string]*runningOp
-	cancelFns  map[string]context.CancelFunc
+	mu        sync.RWMutex
+	running   map[string]*runningOp
+	cancelFns map[string]context.CancelFunc
+
+	// Completed operations history (ring buffer)
+	historyMu sync.RWMutex
+	history   []OperationRecord
+	maxHistory int
 }
 
 type runningOp struct {
@@ -39,18 +45,64 @@ type runningOp struct {
 	Result  *domain.OperationResult
 }
 
+type OperationRecord struct {
+	Request  domain.OperationRequest `json:"request"`
+	Result   *domain.OperationResult `json:"result"`
+	Error    string                  `json:"error,omitempty"`
+	Finished time.Time               `json:"finished"`
+}
+
 func NewExecutor(ops *docker.Operations, locker ProjectLocker, resolver ProjectResolver, auditor AuditLogger, logger *slog.Logger) *Executor {
-	return &Executor{
-		ops:       ops,
-		locker:    locker,
-		resolver:  resolver,
-		auditor:   auditor,
-		logger:    logger,
-		running:   make(map[string]*runningOp),
-		cancelFns: make(map[string]context.CancelFunc),
+	e := &Executor{
+		ops:        ops,
+		locker:     locker,
+		resolver:   resolver,
+		auditor:    auditor,
+		queue:      NewPriorityQueue(),
+		logger:     logger,
+		running:    make(map[string]*runningOp),
+		cancelFns:  make(map[string]context.CancelFunc),
+		history:    make([]OperationRecord, 0, 256),
+		maxHistory: 256,
+	}
+	return e
+}
+
+// StartWorkers starts N background workers that pull from the priority queue.
+func (e *Executor) StartWorkers(ctx context.Context, numWorkers int) {
+	for i := 0; i < numWorkers; i++ {
+		go e.worker(ctx, i)
 	}
 }
 
+func (e *Executor) worker(ctx context.Context, id int) {
+	for {
+		req, ok := e.queue.Dequeue()
+		if !ok {
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		e.executeQueued(ctx, req)
+	}
+}
+
+// Submit enqueues an operation for async execution by workers.
+// Returns the operation ID immediately. Use GetOperation to poll result.
+func (e *Executor) Submit(req domain.OperationRequest) string {
+	if req.ID == "" {
+		req.ID = uuid.New().String()
+	}
+	if req.Timeout == 0 {
+		req.Timeout = 5 * time.Minute
+	}
+	req.CreatedAt = time.Now()
+	e.queue.Enqueue(req)
+	return req.ID
+}
+
+// Execute runs an operation synchronously (blocking), used for direct API calls.
 func (e *Executor) Execute(ctx context.Context, req domain.OperationRequest) (*domain.OperationResult, error) {
 	if req.ID == "" {
 		req.ID = uuid.New().String()
@@ -60,6 +112,7 @@ func (e *Executor) Execute(ctx context.Context, req domain.OperationRequest) (*d
 	}
 	req.CreatedAt = time.Now()
 
+	// Check if project already locked
 	if locked, holder := e.locker.IsLocked(req.Scope.ProjectID); locked {
 		return nil, &domain.AppError{
 			Code:       apierr.ErrOperationInProgress,
@@ -69,6 +122,23 @@ func (e *Executor) Execute(ctx context.Context, req domain.OperationRequest) (*d
 		}
 	}
 
+	return e.run(ctx, req)
+}
+
+func (e *Executor) executeQueued(ctx context.Context, req domain.OperationRequest) {
+	result, err := e.run(ctx, req)
+	record := OperationRecord{
+		Request:  req,
+		Result:   result,
+		Finished: time.Now(),
+	}
+	if err != nil {
+		record.Error = err.Error()
+	}
+	e.addHistory(record)
+}
+
+func (e *Executor) run(ctx context.Context, req domain.OperationRequest) (*domain.OperationResult, error) {
 	opCtx, cancel := context.WithTimeout(ctx, req.Timeout)
 	defer cancel()
 
@@ -96,9 +166,10 @@ func (e *Executor) Execute(ctx context.Context, req domain.OperationRequest) (*d
 	}
 
 	startTime := time.Now()
-	result, err := e.executeOp(opCtx, req, project)
+	result, execErr := e.executeOp(opCtx, req, project)
 	duration := time.Since(startTime)
 
+	// Audit
 	auditEntry := domain.AuditEntry{
 		UserID:     req.UserID,
 		ProjectID:  string(req.Scope.ProjectID),
@@ -109,15 +180,14 @@ func (e *Executor) Execute(ctx context.Context, req domain.OperationRequest) (*d
 	if req.Scope.Services != nil {
 		auditEntry.Scope = &domain.OpScope{Services: req.Scope.Services}
 	}
-
-	if err != nil {
+	if execErr != nil {
 		auditEntry.Status = "failed"
-		if appErr, ok := err.(*domain.AppError); ok {
+		if appErr, ok := execErr.(*domain.AppError); ok {
 			auditEntry.ErrorCode = appErr.Code
 			auditEntry.ErrorMsg = appErr.Message
 		} else {
 			auditEntry.ErrorCode = apierr.ErrInternal
-			auditEntry.ErrorMsg = err.Error()
+			auditEntry.ErrorMsg = execErr.Error()
 		}
 	} else if result != nil {
 		auditEntry.Status = string(result.Status)
@@ -126,16 +196,21 @@ func (e *Executor) Execute(ctx context.Context, req domain.OperationRequest) (*d
 			auditEntry.ErrorMsg = result.Error.Message
 		}
 	}
-
 	if e.auditor != nil {
 		_ = e.auditor.LogOperation(context.Background(), auditEntry)
 	}
 
-	if err != nil {
-		return nil, err
+	if execErr != nil {
+		return nil, execErr
 	}
 
 	result.RequestID = req.ID
+	// Store in history
+	e.addHistory(OperationRecord{
+		Request:  req,
+		Result:   result,
+		Finished: time.Now(),
+	})
 	return result, nil
 }
 
@@ -145,6 +220,11 @@ func (e *Executor) Cancel(opID string) error {
 	e.mu.RUnlock()
 
 	if !ok {
+		// Also check queue
+		if e.queue.Remove(opID) {
+			e.logger.Info("operation removed from queue", "operation_id", opID)
+			return nil
+		}
 		return &domain.AppError{
 			Code:       apierr.ErrOperationNotFound,
 			Message:    "operation not found or already completed",
@@ -160,12 +240,54 @@ func (e *Executor) Cancel(opID string) error {
 func (e *Executor) GetRunningOps() []domain.OperationRequest {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-
 	ops := make([]domain.OperationRequest, 0, len(e.running))
 	for _, op := range e.running {
 		ops = append(ops, op.Request)
 	}
 	return ops
+}
+
+// GetOperation returns a running or completed operation by ID.
+func (e *Executor) GetOperation(opID string) (*OperationRecord, bool) {
+	// Check running
+	e.mu.RLock()
+	if op, ok := e.running[opID]; ok {
+		e.mu.RUnlock()
+		return &OperationRecord{
+			Request: op.Request,
+			Result:  &domain.OperationResult{RequestID: opID, Status: domain.OpStatusRunning},
+		}, true
+	}
+	e.mu.RUnlock()
+
+	// Check history
+	e.historyMu.RLock()
+	defer e.historyMu.RUnlock()
+	for i := len(e.history) - 1; i >= 0; i-- {
+		if e.history[i].Request.ID == opID {
+			return &e.history[i], true
+		}
+	}
+
+	return nil, false
+}
+
+// GetQueueLen returns the current queue length.
+func (e *Executor) GetQueueLen() int {
+	return e.queue.Len()
+}
+
+func (e *Executor) addHistory(record OperationRecord) {
+	e.historyMu.Lock()
+	defer e.historyMu.Unlock()
+	if len(e.history) >= e.maxHistory {
+		e.history = e.history[1:]
+	}
+	e.history = append(e.history, record)
+}
+
+func (e *Executor) Close() {
+	e.queue.Close()
 }
 
 func (e *Executor) executeOp(ctx context.Context, req domain.OperationRequest, project *domain.Project) (*domain.OperationResult, error) {
