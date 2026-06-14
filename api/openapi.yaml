@@ -1,0 +1,422 @@
+openapi: "3.0.3"
+info:
+  title: ComposeCockpit API
+  description: Manages multiple Docker Compose projects with multi-user support
+  version: "1.0.0"
+  contact:
+    name: ComposeCockpit
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+paths:
+  /health:
+    get:
+      summary: Liveness probe
+      tags: [System]
+      responses:
+        "200":
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /ready:
+    get:
+      summary: Readiness probe
+      tags: [System]
+      responses:
+        "200":
+          description: All dependencies healthy
+        "503":
+          description: One or more dependencies unhealthy
+
+  /api/v1/auth/login:
+    post:
+      summary: Authenticate user
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Token pair returned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/auth/refresh:
+    post:
+      summary: Refresh access token
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "200":
+          description: New token pair
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/projects:
+    get:
+      summary: List projects visible to current user
+      tags: [Projects]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: List of projects
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  /api/v1/projects/scan:
+    post:
+      summary: Trigger project re-discovery
+      tags: [Projects]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Scan results
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/projects/{projectID}:
+    get:
+      summary: Get project detail with live container state
+      tags: [Projects]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/projectID"
+      responses:
+        "200":
+          description: Project detail
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/projects/{projectID}/up:
+    post:
+      summary: Create and start project containers
+      tags: [Operations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/projectID"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OperationBody"
+      responses:
+        "200":
+          description: Operation result
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /api/v1/projects/{projectID}/down:
+    post:
+      summary: Stop and remove project containers
+      tags: [Operations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/projectID"
+      responses:
+        "200":
+          description: Operation result
+
+  /api/v1/projects/{projectID}/start:
+    post:
+      summary: Start stopped project containers
+      tags: [Operations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/projectID"
+      responses:
+        "200":
+          description: Operation result
+
+  /api/v1/projects/{projectID}/stop:
+    post:
+      summary: Stop running project containers
+      tags: [Operations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/projectID"
+      responses:
+        "200":
+          description: Operation result
+
+  /api/v1/projects/{projectID}/restart:
+    post:
+      summary: Restart project containers
+      tags: [Operations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/projectID"
+      responses:
+        "200":
+          description: Operation result
+
+  /api/v1/projects/{projectID}/events:
+    get:
+      summary: "SSE: Container lifecycle events for project"
+      tags: [Streaming]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/projectID"
+      responses:
+        "200":
+          description: SSE event stream
+          content:
+            text/event-stream: {}
+
+  /api/v1/projects/{projectID}/stats:
+    get:
+      summary: "SSE: CPU/memory stats stream"
+      tags: [Streaming]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/projectID"
+      responses:
+        "200":
+          description: SSE stats stream
+
+  /api/v1/projects/{projectID}/services/{serviceName}/logs:
+    get:
+      summary: "SSE: Multiplexed log tail for a service"
+      tags: [Streaming]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/projectID"
+        - $ref: "#/components/parameters/serviceName"
+      responses:
+        "200":
+          description: SSE log stream
+
+  /api/v1/operations/{opID}:
+    get:
+      summary: Get operation status
+      tags: [Operations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: opID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Operation details
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      summary: Cancel a running operation
+      tags: [Operations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: opID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Operation cancelled
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/users:
+    get:
+      summary: List users (admin only)
+      tags: [Users]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Paginated user list
+    post:
+      summary: Create user (admin only)
+      tags: [Users]
+      security:
+        - bearerAuth: []
+      responses:
+        "201":
+          description: User created
+
+  /api/v1/audit:
+    get:
+      summary: Query audit log (admin only)
+      tags: [Audit]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        "200":
+          description: Paginated audit entries
+
+  /api/v1/projects/{projectID}/audit:
+    get:
+      summary: Project-scoped audit log
+      tags: [Audit]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/projectID"
+      responses:
+        "200":
+          description: Paginated audit entries
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    projectID:
+      name: projectID
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Project ID (SHA256 hash of path)
+    serviceName:
+      name: serviceName
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+
+    OperationBody:
+      type: object
+      properties:
+        services:
+          type: array
+          items:
+            type: string
+          description: Specific services to target (empty = all)
+        timeout:
+          type: string
+          description: Operation timeout (e.g. "5m", "30s")
+
+    SuccessResponse:
+      type: object
+      properties:
+        data:
+          type: object
+        meta:
+          $ref: "#/components/schemas/Meta"
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              example: ERR_PORT_CONFLICT
+            message:
+              type: string
+            details:
+              type: object
+        meta:
+          $ref: "#/components/schemas/Meta"
+
+    Meta:
+      type: object
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        timestamp:
+          type: string
+          format: date-time
+
+    HealthResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            status:
+              type: string
+              example: ok
+
+  responses:
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Forbidden:
+      description: Insufficient permissions
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Conflict:
+      description: Resource conflict (port, lock, etc.)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"

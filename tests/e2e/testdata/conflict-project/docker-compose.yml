@@ -1,0 +1,5 @@
+services:
+  conflict-web:
+    image: nginx:alpine
+    ports:
+      - "80:80"

@@ -1,0 +1,9 @@
+services:
+  app:
+    image: alpine:latest
+    command: ["sleep", "3600"]
+    environment:
+      - APP_ENV=production
+      - DEBUG=true
+    ports:
+      - "9090:8080"
