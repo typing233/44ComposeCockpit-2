@@ -90,6 +90,14 @@ type ImagePullOpts struct {
 	AuthConfig string
 }
 
+type ImageBuildOpts struct {
+	Context    string
+	Dockerfile string
+	Tags       []string
+	BuildArgs  map[string]string
+	Target     string
+}
+
 type EventsOptions struct {
 	Since   string
 	Until   string
@@ -142,6 +150,7 @@ type Client interface {
 	VolumeList(ctx context.Context) ([]VolumeInfo, error)
 
 	ImagePull(ctx context.Context, ref string, opts ImagePullOpts) (io.ReadCloser, error)
+	ImageBuild(ctx context.Context, opts ImageBuildOpts) error
 	ImageExists(ctx context.Context, ref string) (bool, error)
 
 	Events(ctx context.Context, opts EventsOptions) (<-chan DockerEvent, <-chan error)

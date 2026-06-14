@@ -120,11 +120,18 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// First registered user becomes admin
+	role := domain.RoleViewer
+	count, err := h.userRepo.Count(r.Context())
+	if err == nil && count == 0 {
+		role = domain.RoleAdmin
+	}
+
 	user := &domain.User{
 		ID:        uuid.New().String(),
 		Username:  req.Username,
 		Email:     req.Email,
-		Role:      domain.RoleViewer,
+		Role:      role,
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}

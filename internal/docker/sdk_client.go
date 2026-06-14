@@ -1,10 +1,14 @@
 package docker
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -271,6 +275,56 @@ func (c *sdkClient) ImageExists(ctx context.Context, ref string) (bool, error) {
 	return true, nil
 }
 
+func (c *sdkClient) ImageBuild(ctx context.Context, opts ImageBuildOpts) error {
+	buildCtx, err := createBuildContext(opts.Context, opts.Dockerfile)
+	if err != nil {
+		return fmt.Errorf("create build context: %w", err)
+	}
+	defer buildCtx.Close()
+
+	dockerfile := opts.Dockerfile
+	if dockerfile == "" {
+		dockerfile = "Dockerfile"
+	}
+
+	buildArgs := make(map[string]*string)
+	for k, v := range opts.BuildArgs {
+		v := v
+		buildArgs[k] = &v
+	}
+
+	resp, err := c.cli.ImageBuild(ctx, buildCtx, types.ImageBuildOptions{
+		Tags:       opts.Tags,
+		Dockerfile: dockerfile,
+		BuildArgs:  buildArgs,
+		Target:     opts.Target,
+		Remove:     true,
+		ForceRemove: true,
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Read the build output to completion to ensure the build finishes
+	decoder := json.NewDecoder(resp.Body)
+	for {
+		var msg struct {
+			Error string `json:"error"`
+		}
+		if err := decoder.Decode(&msg); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+		if msg.Error != "" {
+			return fmt.Errorf("build error: %s", msg.Error)
+		}
+	}
+	return nil
+}
+
 func (c *sdkClient) Events(ctx context.Context, opts EventsOptions) (<-chan DockerEvent, <-chan error) {
 	f := filters.NewArgs()
 	for k, vals := range opts.Filters {
@@ -410,4 +464,54 @@ func ParseStats(data []byte) (*ContainerStats, error) {
 func parseTime(s string) time.Time {
 	t, _ := time.Parse(time.RFC3339Nano, s)
 	return t
+}
+
+func createBuildContext(contextDir, dockerfile string) (io.ReadCloser, error) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+
+	err := filepath.Walk(contextDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel(contextDir, path)
+		if err != nil {
+			return err
+		}
+		if relPath == "." {
+			return nil
+		}
+
+		header, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		header.Name = relPath
+
+		if err := tw.WriteHeader(header); err != nil {
+			return err
+		}
+
+		if info.IsDir() {
+			return nil
+		}
+
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(tw, f)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tw.Close(); err != nil {
+		return nil, err
+	}
+
+	return io.NopCloser(&buf), nil
 }

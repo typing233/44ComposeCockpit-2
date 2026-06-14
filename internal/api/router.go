@@ -20,6 +20,7 @@ type RouterDeps struct {
 	EventsHandler    *handlers.EventsHandler
 	UserHandler      *handlers.UserHandler
 	AuditHandler     *handlers.AuditHandler
+	ACLHandler       *handlers.ACLHandler
 	HealthHandler    *handlers.HealthHandler
 	JWTManager       *auth.JWTManager
 	ACLRepo          store.ACLRepository
@@ -79,7 +80,12 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 				r.Get("/audit", deps.AuditHandler.ListByProject)
 
 				// ACL management (admin only)
-				r.With(auth.RequireRole(domain.RoleAdmin)).Get("/acl", deps.AuditHandler.ListAll)
+				r.Route("/acl", func(r chi.Router) {
+					r.Use(auth.RequireRole(domain.RoleAdmin))
+					r.Get("/", deps.ACLHandler.ListByProject)
+					r.Post("/", deps.ACLHandler.Grant)
+					r.Delete("/{userID}", deps.ACLHandler.Revoke)
+				})
 
 				// Operations (require project ACL operate)
 				r.Group(func(r chi.Router) {

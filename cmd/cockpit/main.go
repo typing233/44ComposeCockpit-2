@@ -51,6 +51,13 @@ func main() {
 	defer db.Close()
 	logger.Info("database connected")
 
+	// Auto-migrate
+	if err := db.AutoMigrate(ctx); err != nil {
+		logger.Error("auto migrate", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("migrations applied")
+
 	// Docker client
 	dockerClient, err := docker.NewClient(cfg.Docker.Host, cfg.Docker.APIVersion)
 	if err != nil {
@@ -113,6 +120,7 @@ func main() {
 	eventsHandler := handlers.NewEventsHandler(sseHandler, streamer, projectHandler, logger)
 	userHandler := handlers.NewUserHandler(userRepo)
 	auditHandler := handlers.NewAuditHandler(auditRepo)
+	aclHandler := handlers.NewACLHandler(aclRepo)
 	healthHandler := handlers.NewHealthHandler(db, dockerClient)
 
 	handlers.SetVersion(buildVersion)
@@ -125,6 +133,7 @@ func main() {
 		EventsHandler:    eventsHandler,
 		UserHandler:      userHandler,
 		AuditHandler:     auditHandler,
+		ACLHandler:       aclHandler,
 		HealthHandler:    healthHandler,
 		JWTManager:       jwtManager,
 		ACLRepo:          aclRepo,

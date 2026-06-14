@@ -221,8 +221,17 @@ func (e *Executor) Cancel(opID string) error {
 
 	if !ok {
 		// Also check queue
-		if e.queue.Remove(opID) {
+		if req, removed := e.queue.RemoveAndReturn(opID); removed {
 			e.logger.Info("operation removed from queue", "operation_id", opID)
+			e.addHistory(OperationRecord{
+				Request: req,
+				Result: &domain.OperationResult{
+					RequestID:  opID,
+					Status:     domain.OpStatusCancelled,
+					FinishedAt: timePtr(time.Now()),
+				},
+				Finished: time.Now(),
+			})
 			return nil
 		}
 		return &domain.AppError{
@@ -236,6 +245,8 @@ func (e *Executor) Cancel(opID string) error {
 	e.logger.Info("operation cancelled", "operation_id", opID)
 	return nil
 }
+
+func timePtr(t time.Time) *time.Time { return &t }
 
 func (e *Executor) GetRunningOps() []domain.OperationRequest {
 	e.mu.RLock()

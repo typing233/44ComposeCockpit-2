@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -171,14 +172,6 @@ func (o *Operations) Up(ctx context.Context, project *domain.Project, services [
 			return result, nil
 		}
 
-		// Skip build-only services (have build but no image and no ports/volumes)
-		if svc.Image == "" && svc.Build != nil {
-			step := domain.OpStep{Service: svc.Name, Action: "skip_build_only"}
-			step.Status = domain.OpStatusSucceeded
-			result.Steps = append(result.Steps, step)
-			continue
-		}
-
 		// If service only has build config but no image tag, generate one
 		imageName := svc.Image
 		if imageName == "" && svc.Build != nil {
@@ -192,28 +185,23 @@ func (o *Operations) Up(ctx context.Context, project *domain.Project, services [
 			continue
 		}
 
-		// Pull image
-		step := domain.OpStep{Service: svc.Name, Action: "pull"}
-		stepStart := time.Now()
+		// Build image if service has build config
+		if svc.Build != nil {
+			step := domain.OpStep{Service: svc.Name, Action: "build"}
+			stepStart := time.Now()
 
-		exists, err := o.client.ImageExists(ctx, imageName)
-		if err != nil {
-			step.Status = domain.OpStatusFailed
-			step.Error = err.Error()
-			step.Duration = time.Since(stepStart)
-			result.Steps = append(result.Steps, step)
-			o.rollbackContainers(context.Background(), startedContainers)
-			o.rollbackVolumes(context.Background(), createdVolumes)
-			o.rollbackNetworks(context.Background(), createdNetworks)
-			result.Status = domain.OpStatusRolledBack
-			result.Error = &domain.OpError{Code: apierr.ErrDockerUnavailable, Message: err.Error()}
-			fin := time.Now()
-			result.FinishedAt = &fin
-			return result, nil
-		}
+			buildCtx := svc.Build.Context
+			if !filepath.IsAbs(buildCtx) {
+				buildCtx = filepath.Join(project.Path, buildCtx)
+			}
 
-		if !exists {
-			reader, err := o.client.ImagePull(ctx, imageName, ImagePullOpts{})
+			err := o.client.ImageBuild(ctx, ImageBuildOpts{
+				Context:    buildCtx,
+				Dockerfile: svc.Build.Dockerfile,
+				Tags:       []string{imageName},
+				BuildArgs:  svc.Build.Args,
+				Target:     svc.Build.Target,
+			})
 			if err != nil {
 				step.Status = domain.OpStatusFailed
 				step.Error = err.Error()
@@ -223,21 +211,62 @@ func (o *Operations) Up(ctx context.Context, project *domain.Project, services [
 				o.rollbackVolumes(context.Background(), createdVolumes)
 				o.rollbackNetworks(context.Background(), createdNetworks)
 				result.Status = domain.OpStatusRolledBack
-				result.Error = &domain.OpError{Code: apierr.ErrImagePullFailed, Message: fmt.Sprintf("failed to pull %s: %v", imageName, err)}
+				result.Error = &domain.OpError{Code: apierr.ErrInternal, Message: fmt.Sprintf("failed to build %s: %v", svc.Name, err)}
 				fin := time.Now()
 				result.FinishedAt = &fin
 				return result, nil
 			}
-			io.Copy(io.Discard, reader)
-			reader.Close()
+			step.Status = domain.OpStatusSucceeded
+			step.Duration = time.Since(stepStart)
+			result.Steps = append(result.Steps, step)
+		} else {
+			// Pull image if not build-based
+			step := domain.OpStep{Service: svc.Name, Action: "pull"}
+			stepStart := time.Now()
+
+			exists, err := o.client.ImageExists(ctx, imageName)
+			if err != nil {
+				step.Status = domain.OpStatusFailed
+				step.Error = err.Error()
+				step.Duration = time.Since(stepStart)
+				result.Steps = append(result.Steps, step)
+				o.rollbackContainers(context.Background(), startedContainers)
+				o.rollbackVolumes(context.Background(), createdVolumes)
+				o.rollbackNetworks(context.Background(), createdNetworks)
+				result.Status = domain.OpStatusRolledBack
+				result.Error = &domain.OpError{Code: apierr.ErrDockerUnavailable, Message: err.Error()}
+				fin := time.Now()
+				result.FinishedAt = &fin
+				return result, nil
+			}
+
+			if !exists {
+				reader, err := o.client.ImagePull(ctx, imageName, ImagePullOpts{})
+				if err != nil {
+					step.Status = domain.OpStatusFailed
+					step.Error = err.Error()
+					step.Duration = time.Since(stepStart)
+					result.Steps = append(result.Steps, step)
+					o.rollbackContainers(context.Background(), startedContainers)
+					o.rollbackVolumes(context.Background(), createdVolumes)
+					o.rollbackNetworks(context.Background(), createdNetworks)
+					result.Status = domain.OpStatusRolledBack
+					result.Error = &domain.OpError{Code: apierr.ErrImagePullFailed, Message: fmt.Sprintf("failed to pull %s: %v", imageName, err)}
+					fin := time.Now()
+					result.FinishedAt = &fin
+					return result, nil
+				}
+				io.Copy(io.Discard, reader)
+				reader.Close()
+			}
+			step.Status = domain.OpStatusSucceeded
+			step.Duration = time.Since(stepStart)
+			result.Steps = append(result.Steps, step)
 		}
-		step.Status = domain.OpStatusSucceeded
-		step.Duration = time.Since(stepStart)
-		result.Steps = append(result.Steps, step)
 
 		// Create container
-		step = domain.OpStep{Service: svc.Name, Action: "create"}
-		stepStart = time.Now()
+		createStep := domain.OpStep{Service: svc.Name, Action: "create"}
+		createStart := time.Now()
 
 		labels := make(map[string]string)
 		for k, v := range projectLabels {
@@ -271,10 +300,10 @@ func (o *Operations) Up(ctx context.Context, project *domain.Project, services [
 
 		containerID, err := o.client.ContainerCreate(ctx, cfg)
 		if err != nil {
-			step.Status = domain.OpStatusFailed
-			step.Error = err.Error()
-			step.Duration = time.Since(stepStart)
-			result.Steps = append(result.Steps, step)
+			createStep.Status = domain.OpStatusFailed
+			createStep.Error = err.Error()
+			createStep.Duration = time.Since(createStart)
+			result.Steps = append(result.Steps, createStep)
 			o.rollbackContainers(context.Background(), startedContainers)
 			o.rollbackVolumes(context.Background(), createdVolumes)
 			o.rollbackNetworks(context.Background(), createdNetworks)
@@ -284,19 +313,19 @@ func (o *Operations) Up(ctx context.Context, project *domain.Project, services [
 			result.FinishedAt = &fin
 			return result, nil
 		}
-		step.Status = domain.OpStatusSucceeded
-		step.Duration = time.Since(stepStart)
-		result.Steps = append(result.Steps, step)
+		createStep.Status = domain.OpStatusSucceeded
+		createStep.Duration = time.Since(createStart)
+		result.Steps = append(result.Steps, createStep)
 
 		// Start container
-		step = domain.OpStep{Service: svc.Name, Action: "start"}
-		stepStart = time.Now()
+		startStep := domain.OpStep{Service: svc.Name, Action: "start"}
+		startStart := time.Now()
 
 		if err := o.client.ContainerStart(ctx, containerID); err != nil {
-			step.Status = domain.OpStatusFailed
-			step.Error = err.Error()
-			step.Duration = time.Since(stepStart)
-			result.Steps = append(result.Steps, step)
+			startStep.Status = domain.OpStatusFailed
+			startStep.Error = err.Error()
+			startStep.Duration = time.Since(startStart)
+			result.Steps = append(result.Steps, startStep)
 			o.client.ContainerRemove(context.Background(), containerID, true)
 			o.rollbackContainers(context.Background(), startedContainers)
 			o.rollbackVolumes(context.Background(), createdVolumes)
@@ -309,9 +338,9 @@ func (o *Operations) Up(ctx context.Context, project *domain.Project, services [
 		}
 
 		startedContainers = append(startedContainers, containerID)
-		step.Status = domain.OpStatusSucceeded
-		step.Duration = time.Since(stepStart)
-		result.Steps = append(result.Steps, step)
+		startStep.Status = domain.OpStatusSucceeded
+		startStep.Duration = time.Since(startStart)
+		result.Steps = append(result.Steps, startStep)
 	}
 
 	finished := time.Now()

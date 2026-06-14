@@ -18,6 +18,7 @@ type UserRepository interface {
 	Update(ctx context.Context, user *domain.User) error
 	Delete(ctx context.Context, id string) error
 	ValidatePassword(ctx context.Context, username, password string) (*domain.User, error)
+	Count(ctx context.Context) (int, error)
 }
 
 type userRepo struct {
@@ -118,4 +119,10 @@ func (r *userRepo) ValidatePassword(ctx context.Context, username, password stri
 		return nil, nil
 	}
 	return user, nil
+}
+
+func (r *userRepo) Count(ctx context.Context) (int, error) {
+	var count int
+	err := r.db.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM users`).Scan(&count)
+	return count, err
 }

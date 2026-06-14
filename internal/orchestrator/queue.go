@@ -121,6 +121,19 @@ func (q *PriorityQueue) Remove(opID string) bool {
 	return false
 }
 
+func (q *PriorityQueue) RemoveAndReturn(opID string) (domain.OperationRequest, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	for i, item := range q.items {
+		if item.request.ID == opID {
+			heap.Remove(&q.items, i)
+			return item.request, true
+		}
+	}
+	return domain.OperationRequest{}, false
+}
+
 func (q *PriorityQueue) Close() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
